@@ -23,6 +23,7 @@ import (
 	"golang.org/x/mod/module"
 	"golang.org/x/mod/semver"
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v2"
 )
@@ -436,29 +437,55 @@ func resolvePackage(pkg string) ([]string, string, error) {
 		return nil, dir, err
 	}
 	var parts []string
+	goImport := ""
+	goSource := ""
 	var f func(*html.Node) bool
 	f = func(n *html.Node) bool {
-		if n.Type == html.ElementNode && n.Data == "meta" {
-			isGoImport := false
+		switch n.DataAtom {
+		case atom.Meta:
+			name := ""
 			content := ""
 			for _, a := range n.Attr {
-				if a.Key == "name" && a.Val == "go-import" {
-					isGoImport = true
+				if a.Key == "name" {
+					name = a.Val
 				} else if a.Key == "content" {
 					content = a.Val
 				}
 			}
-			if !isGoImport {
-				return false
+			if name == "go-import" {
+				goImport = content
+			} else if name == "go-source" {
+				goSource = content
 			}
-			contentFields := strings.Fields(content)
-			importPrefix := contentFields[0]
-			if !strings.HasPrefix(pkg, importPrefix) {
-				return false
+		}
+		if n.Type == html.DocumentNode ||
+			n.DataAtom == atom.Html || n.DataAtom == atom.Head {
+			for c := range n.ChildNodes() {
+				if f(c) {
+					return true
+				}
 			}
+		}
+		return goImport != "" && goSource != ""
+	}
+	f(doc)
+	if goImport != "" {
+		contentFields := strings.Fields(goImport)
+		importPrefix := contentFields[0]
+		if strings.HasPrefix(pkg, importPrefix) {
 			u, err := url.Parse(contentFields[2])
 			if err != nil {
-				return false
+				return nil, dir, err
+			}
+			if goSource != "" && u.Hostname() != "github.com" {
+				contentFields := strings.Fields(goSource)
+				sourcePrefix := contentFields[1]
+				if sourcePrefix != "_" {
+					sourceUrl, err := url.Parse(sourcePrefix)
+					if err == nil && sourceUrl.Hostname() == "github.com" {
+						u = sourceUrl
+					}
+				}
 			}
 			pathParts := strings.Split(u.Path, "/")
 			// Filter empty strings
@@ -470,32 +497,21 @@ func resolvePackage(pkg string) ([]string, string, error) {
 				}
 			}
 			pathParts = pathParts[:n]
-			if len(pathParts) == 0 {
-				return false
-			}
-			parts = append([]string{u.Host}, pathParts...)
-			// Remove ".git" suffix
-			parts[len(parts)-1] = strings.TrimSuffix(parts[len(parts)-1], ".git")
-			if len(pkg) > len(importPrefix) {
-				dir = pkg[len(importPrefix)+1:]
-			}
-			if debugOn {
-				log.Printf("Resolved dependency %s to %s", pkg, strings.Join(parts, "/"))
-			}
-			return true
-		}
-		for c := n.FirstChild; c != nil; c = c.NextSibling {
-			if f(c) {
-				return true
+			if len(pathParts) != 0 {
+				parts = append([]string{u.Host}, pathParts...)
+				// Remove ".git" suffix
+				parts[len(parts)-1] = strings.TrimSuffix(parts[len(parts)-1], ".git")
+				if len(pkg) > len(importPrefix) {
+					dir = pkg[len(importPrefix)+1:]
+				}
+				if debugOn {
+					log.Printf("Resolved dependency %s to %s", pkg, strings.Join(parts, "/"))
+				}
+				return parts, dir, nil
 			}
 		}
-		return false
 	}
-	if f(doc) {
-		return parts, dir, nil
-	} else {
-		return nil, dir, errors.New(fmt.Sprintf("Invalid package ID: %s", pkg))
-	}
+	return nil, dir, errors.New(fmt.Sprintf("Invalid package ID: %s", pkg))
 }
 
 func dependencies(pkg Package, lockfileDir string) ([]Dependency, error) {
